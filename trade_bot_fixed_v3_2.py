@@ -117,14 +117,14 @@ class Database:
     def position_close(self, signal_id, closed, price, reason, pnl):
         self.cx.execute("UPDATE positions SET close_time=?,close_price=?,exit_reason=?,pnl=? WHERE signal_id=?",(str(closed),price,reason,pnl,signal_id)); self.cx.commit()
     def open_records(self): return self.cx.execute("SELECT * FROM positions WHERE close_time IS NULL").fetchall()
-
+MT5_TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 class MT5Client:
     def __init__(self, c): self.c=c; self.api=None; self.symbol=None; self.info=None
     def connect(self):
         try: import MetaTrader5 as mt5
         except ImportError as e: raise RuntimeError("MetaTrader5 package is missing") from e
         self.api=mt5
-        if not mt5.initialize(): raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+        if not mt5.initialize(path=MT5_TERMINAL_PATH): raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
         if not mt5.login(self.c.login, password=self.c.password, server=self.c.server): raise RuntimeError(f"MT5 login failed: {mt5.last_error()}")
         acct=mt5.account_info()
         if acct is None or int(acct.login)!=self.c.login: raise RuntimeError("Connected account does not match --login")
