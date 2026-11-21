@@ -460,13 +460,67 @@ def _setup_diagnostics(s, c=None):
             'risk_ok': s.get('risk_ok', 'NONE'),
             'entry_rejection_reason': s.get('entry_rejection_reason', ''),
             }
-def first_exit(direction, candles, entry_or_sl, sl_or_tp, tp=None):
-    sl, tp = (sl_or_tp, tp) if tp is not None else (entry_or_sl, sl_or_tp)
-    for t,r in candles.iterrows():
-        hit_sl=(float(r.High)>=sl) if direction=='short' else (float(r.Low)<=sl)
-        hit_tp=(float(r.Low)<=tp) if direction=='short' else (float(r.High)>=tp)
-        if hit_sl or hit_tp: return t, (sl if hit_sl else tp), ('sl' if hit_sl else 'tp')
-    return None,None,None
+def find_reset_crossing(direction, candles, sweep_price, exit_time):
+    """
+    Find the first wick-based crossing beyond the original
+    London sweep extreme, strictly after the invalidation candle.
+
+    BUY setup: price trades below the original London low sweep.
+    SELL setup: price trades above the original London high sweep.
+    """
+    if direction not in ('long', 'short'):
+        raise ValueError(f"Invalid direction: {direction}")
+
+    sweep_price = float(sweep_price)
+
+    # Do not inspect the invalidation candle itself:
+    # M1 data cannot establish the order of events within that candle.
+    candles = candles.loc[candles.index > exit_time]
+
+    for t, r in candles.iterrows():
+        if direction == 'long' and float(r.Low) < sweep_price:
+            return t
+
+        if direction == 'short' and float(r.High) > sweep_price:
+            return t
+
+    return None
+def first_exit(direction, candles, sl, tp):
+    """
+    Check whether original SL or TP was touched after setup formation.
+
+    Returns:
+        (timestamp, price, result)
+        result = 'sl', 'tp', 'ambiguous', or None
+    """
+    if direction not in ('long', 'short'):
+        raise ValueError(f"Invalid direction: {direction}")
+
+    sl = float(sl)
+    tp = float(tp)
+
+    for t, r in candles.iterrows():
+        high = float(r.High)
+        low = float(r.Low)
+
+        if direction == 'long':
+            hit_sl = low <= sl
+            hit_tp = high >= tp
+        else:
+            hit_sl = high >= sl
+            hit_tp = low <= tp
+
+        if hit_sl and hit_tp:
+            return t, None, 'ambiguous'
+
+        if hit_sl:
+            return t, sl, 'sl'
+
+        if hit_tp:
+            return t, tp, 'tp'
+
+    return None, None, None
+
 def phase27_live_state(df,c):
     """One causal Phase 27 state machine for both status and executable signal.
 
@@ -579,29 +633,137 @@ def phase27_live_state(df,c):
                             (direction, s, entry, sl, tp, structural_stop, risk, trend)
                         )
             if candidates:
-                # Phase 27 runs bearish processing before bullish processing on a shared candle.
-                direction,s,entry,sl,tp,structural_stop,risk,trend=candidates[0]
-                provenance={'london_high':lh,'london_high_time':lh_time,'london_low':ll,'london_low_time':ll_time,'sweep_type':'HIGH' if direction=='short' else 'LOW','sweep_price':float(row.High if direction=='short' else row.Low),'sweep_time':str(s['sweep']),'swept_level':lh if direction=='short' else ll,'bos_direction':direction,'bos_price':float(row.Close),'bos_time':str(s['bos']),'bos_broken_level':s['broken']['value'],'ote_anchor_1':s['anchor_pivot']['value'],'ote_anchor_1_time':str(s['anchor_pivot']['center']),'ote_anchor_2':s['extreme'],'ote_anchor_2_time':str(s['retrace']),'ote_calculation_method':'phase27_anchor_extreme_retrace_frozen_at_first_touch','ote_ratio':c.ote,'ote_effective_retracement':1.0-c.ote,'ote_price':s['ote'],'ote_touch_price':float(row.High if direction=='short' else row.Low),'ote_touch_time':str(s['retrace']),'pivot_confirmation':str(s['anchor_pivot']['confirmation']),'pivot_level':s['anchor_pivot']['value'],'bos_pivot_confirmation':str(s['broken']['confirmation']),'bos_pivot_level':s['broken']['value'],'structural_stop_reference':structural_stop,'trend_direction':trend,'displacement_confirmation':''}
-                signal={'timestamp':t,'side':direction,'entry':entry,'sl':sl,'tp':tp,'risk_distance':risk,'provenance':provenance}
-                completed=True
-                diagnostics={'timestamp':newest,'current_price':float(df.iloc[-1].Close),'session':cycle_session,'london':{'high':lh,'high_time':lh_time,'low':ll,'low_time':ll_time},'short':_setup_diagnostics(side['short'],c), 'long':_setup_diagnostics(side['long'],c)}
-                if t==newest: return {'timestamp':newest,'state':'ENTRY_SIGNAL','signal':signal,'diagnostics':diagnostics}
-                latest_state={'timestamp':newest,'state':'SIGNAL_COMPLETED','signal':None,'diagnostics':diagnostics}
-            elif t==newest:
-                if not any(x['sweep'] for x in side.values()):
-                    stage = 'WAITING_SWEEP'
-                elif not any(x['bos'] for x in side.values()):
-                    stage = 'WAITING_BOS'
-                elif not any(x['retrace'] for x in side.values()):
-                    stage = 'WAITING_FIRST_OTE_TOUCH'
-                elif any(
-                    x.get('second_touch')
-                    and x.get('risk_ok') is False
-                    for x in side.values()
-                ):
-                    stage = 'SECOND_TOUCH_RISK_FILTER_FAILED'
-                else:
-                    stage = 'WAITING_ENTRY_TOUCH'
+                # Preserve Phase 27 bearish-first candidate selection.
+                direction, s, entry, sl, tp, structural_stop, risk, trend = candidates[0]
+
+                provenance = {
+                    'london_high': lh,
+                    'london_high_time': lh_time,
+                    'london_low': ll,
+                    'london_low_time': ll_time,
+                    'sweep_type': 'HIGH' if direction == 'short' else 'LOW',
+
+                    # Original London liquidity sweep extreme.
+                    'sweep_price': float(s['sweep_price']),
+
+                    'sweep_time': str(s['sweep']),
+                    'swept_level': lh if direction == 'short' else ll,
+                    'bos_direction': direction,
+                    'bos_price': float(s['bos_price']),
+                    'bos_time': str(s['bos']),
+                    'bos_broken_level': s['broken']['value'],
+                    'ote_anchor_1': s['anchor_pivot']['value'],
+                    'ote_anchor_1_time': str(s['anchor_pivot']['center']),
+                    'ote_anchor_2': s['extreme'],
+                    'ote_anchor_2_time': str(s['retrace']),
+                    'ote_calculation_method': 'phase27_anchor_extreme_retrace_frozen_at_first_touch',
+                    'ote_ratio': c.ote,
+                    'ote_effective_retracement': 1.0 - c.ote,
+                    'ote_price': s['ote'],
+                    'ote_touch_price': float(row.High if direction == 'short' else row.Low),
+                    'ote_touch_time': str(s['retrace']),
+                    'pivot_confirmation': str(s['anchor_pivot']['confirmation']),
+                    'pivot_level': s['anchor_pivot']['value'],
+                    'bos_pivot_confirmation': str(s['broken']['confirmation']),
+                    'bos_pivot_level': s['broken']['value'],
+                    'structural_stop_reference': structural_stop,
+                    'trend_direction': trend,
+                    'displacement_confirmation': ''
+                }
+
+                signal = {
+                    'timestamp': t,
+                    'side': direction,
+                    'entry': entry,
+                    'sl': sl,
+                    'tp': tp,
+                    'risk_distance': risk,
+                    'provenance': provenance
+                }
+
+                diagnostics = {
+                    'timestamp': newest,
+                    'current_price': float(df.iloc[-1].Close),
+                    'session': cycle_session,
+                    'london': {
+                        'high': lh,
+                        'high_time': lh_time,
+                        'low': ll,
+                        'low_time': ll_time
+                    },
+                    'short': _setup_diagnostics(side['short'], c),
+                    'long': _setup_diagnostics(side['long'])
+                }
+
+                if t == newest:
+                    completed = True
+                    return {
+                        'timestamp': newest,
+                        'state': 'ENTRY_SIGNAL',
+                        'signal': signal,
+                        'recovery': None,
+                        'diagnostics': diagnostics
+                    }
+
+                # Candidate formed on an earlier candle.
+                # Only inspect candles strictly after its formation.
+                future_candles = df.loc[df.index > t]
+
+                exit_time, exit_price, exit_result = first_exit(
+                    direction,
+                    future_candles,
+                    sl,
+                    tp
+                )
+
+                if exit_result is None:
+                    completed = True
+                    return {
+                        'timestamp': newest,
+                        'state': 'RECOVERY_PENDING',
+                        'signal': None,
+                        'recovery': signal,
+                        'diagnostics': diagnostics
+                    }
+
+                # Original SL/TP was reached. Find the later London sweep reset.
+                sweep_price = float(provenance['sweep_price'])
+
+                reset_time = find_reset_crossing(
+                    direction,
+                    df,
+                    sweep_price,
+                    exit_time
+                )
+
+                completed = True
+
+                if reset_time is None:
+                    return {
+                        'timestamp': newest,
+                        'state': 'WAITING_RESET',
+                        'signal': None,
+                        'recovery': None,
+                        'exit_time': exit_time,
+                        'exit_price': exit_price,
+                        'exit_result': exit_result,
+                        'reset_time': None,
+                        'reset_price': sweep_price,
+                        'diagnostics': diagnostics
+                    }
+
+                return {
+                    'timestamp': newest,
+                    'state': 'RESET_CONFIRMED',
+                    'signal': None,
+                    'recovery': None,
+                    'exit_time': exit_time,
+                    'exit_price': exit_price,
+                    'exit_result': exit_result,
+                    'reset_time': reset_time,
+                    'reset_price': sweep_price,
+                    'diagnostics': diagnostics
+                }
                 latest_state={'timestamp':newest,'state':stage,'signal':None,'diagnostics':{'timestamp':newest,'current_price':float(row.Close),'session':cycle_session,'london':{'high':lh,'high_time':lh_time,'low':ll,'low_time':ll_time},'short':_setup_diagnostics(side['short'],c), 'long':_setup_diagnostics(side['long'],c)}}
     return latest_state
 
@@ -609,6 +771,59 @@ def run_strategy(df,c):
     """Compatibility adapter: only return a signal made by the newest closed bar."""
     state=phase27_live_state(df,c)
     return [state['signal']] if state['signal'] is not None else []
+
+def recovery_entry_status(row, bid, ask):
+    """
+    Check whether a recovered setup is waiting for its original entry,
+    ready for market execution, or invalidated.
+
+    Uses executable quotes:
+      BUY  -> Ask
+      SELL -> Bid
+    """
+    side = row['side']
+    entry = float(row['entry'])
+    sl = float(row['sl'])
+    tp = float(row['tp'])
+
+    bid = float(bid)
+    ask = float(ask)
+
+    if not all(math.isfinite(x) and x > 0
+               for x in (entry, sl, tp, bid, ask)):
+        return 'INVALID', 'invalid_price'
+
+    if side == 'long':
+        if not sl < entry < tp:
+            return 'INVALID', 'invalid_buy_levels'
+
+        if ask <= sl:
+            return 'INVALID', 'original_sl_reached'
+
+        if ask >= tp:
+            return 'INVALID', 'original_tp_reached'
+
+        if ask <= entry:
+            return 'READY', 'original_entry_reached'
+
+        return 'WAITING', 'waiting_for_buy_retrace'
+
+    elif side == 'short':
+        if not tp < entry < sl:
+            return 'INVALID', 'invalid_sell_levels'
+
+        if bid >= sl:
+            return 'INVALID', 'original_sl_reached'
+
+        if bid <= tp:
+            return 'INVALID', 'original_tp_reached'
+
+        if bid >= entry:
+            return 'READY', 'original_entry_reached'
+
+        return 'WAITING', 'waiting_for_sell_retrace'
+
+    return 'INVALID', 'unknown_direction'
 
 def _fmt(v):
     if v is None or v == 'NONE': return 'NONE/WAITING'
@@ -657,8 +872,28 @@ def position_snapshot(client, db=None):
         return LAST_COMPLETED_POSITION or {'status':'NONE'}
     p=positions[0]
     return {'status':'POSITION OPEN','direction':getattr(p,'type','UNKNOWN'),'ticket':getattr(p,'ticket','NONE'),'entry_price':getattr(p,'price_open','NONE'),'sl':getattr(p,'sl','NONE'),'tp':getattr(p,'tp','NONE'),'volume':getattr(p,'volume','NONE'),'open_time':getattr(p,'time','UNKNOWN')}
+def monitor_recovery_entry(client, row):
+    """
+    Check a recovered setup against the latest executable quote.
 
-def execute_signal(c,client,db,row):
+    Returns:
+        (status, reason, bid, ask)
+    """
+    tick = client.api.symbol_info_tick(client.symbol)
+
+    if tick is None:
+        return 'WAITING', 'missing_tick', None, None
+
+    bid = float(getattr(tick, 'bid', 0) or 0)
+    ask = float(getattr(tick, 'ask', 0) or 0)
+
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return 'WAITING', 'invalid_tick', bid, ask
+
+    status, reason = recovery_entry_status(row, bid, ask)
+
+    return status, reason, bid, ask
+def execute_signal(c,client,db,row,fixed_levels=False):
     sid=signal_id(client.symbol,row)
     def reject(reason, details=""):
         LAST_EXECUTION.update(state='ENTRY_REJECTED', reason=reason)
@@ -690,8 +925,31 @@ def execute_signal(c,client,db,row):
         return reject('SPREAD',f'spread={spread}')
     logging.info('[EXECUTION_CHECK] spread=PASS value=%s limit=%s',spread,c.max_spread)
     entry=ask if row['side']=='long' else bid
-    anchor=float(row['provenance']['ote_anchor_1'])
-    sl,tp,structural_stop,risk_distance=construct_phase27_order(row['side'],entry,anchor,c.sl,c.tp)
+
+    if fixed_levels:
+        # Recovered setup: preserve its original strategy SL and TP.
+        sl=float(row['sl'])
+        tp=float(row['tp'])
+        structural_stop=float(
+            row['provenance'].get('structural_stop_reference', sl)
+        )
+        risk_distance=abs(entry-sl)
+
+        # Do not chase the original entry.
+        if row['side']=='long':
+            if not sl < entry <= float(row['entry']):
+                return reject('RECOVERY_ENTRY_PRICE_OUTSIDE_VALID_ZONE')
+        else:
+            if not float(row['entry']) <= entry < sl:
+                return reject('RECOVERY_ENTRY_PRICE_OUTSIDE_VALID_ZONE')
+
+    else:
+        # Normal setup: retain the existing live-price calculation.
+        anchor=float(row['provenance']['ote_anchor_1'])
+        sl,tp,structural_stop,risk_distance=construct_phase27_order(
+            row['side'],entry,anchor,c.sl,c.tp
+        )
+
     geometry_ok=(sl<entry<tp) if row['side']=='long' else (tp<entry<sl)
     if not geometry_ok:
         logging.info('[EXECUTION_CHECK] geometry=FAIL strategy_entry=%.5f execution_price=%.5f sl=%.5f tp=%.5f',row['entry'],entry,sl,tp)
