@@ -30,6 +30,7 @@ class Config:
     tp: float = 3.0
     lot: float = .01
     risk_percent: float = 0.0
+    max_risk_percent: float = 3.0
     magic: int = 20260906
     max_spread: float = 0.0
     max_daily_loss: float = 0.0
@@ -48,7 +49,10 @@ def parse_config(argv=None):
     # supplied by BAT environment variables and never accepted as CLI args.
     p.add_argument("--login", type=int, default=int(os.environ.get("MT5_LOGIN", "0") or 0)); p.add_argument("--server", default=os.environ.get("MT5_SERVER", ""))
     p.add_argument("--symbol", default="XAUUSD"); p.add_argument("--pivot", type=int, default=3); p.add_argument("--ote", type=float, default=.60); p.add_argument("--sl", type=float, default=.90); p.add_argument("--tp", type=float, default=3.0)
-    p.add_argument("--lot", type=float, default=.01); p.add_argument("--risk-percent", type=float, default=0.0); p.add_argument("--magic", type=int, default=20260906)
+    p.add_argument("--lot", type=float, default=.01)
+    p.add_argument("--risk-percent", type=float, default=float(os.environ.get("RISK_PERCENT", "0")))
+    p.add_argument("--max-risk-percent", type=float, default=float(os.environ.get("MAX_RISK_PERCENT", "3.0")))
+    p.add_argument("--magic", type=int, default=20260906)
     p.add_argument("--max-spread", type=float, default=0.0); p.add_argument("--max-daily-loss", type=float, default=0.0); p.add_argument("--max-open-positions", type=int, default=1); p.add_argument("--database", default=str(HERE / "paper_trades.sqlite3")); p.add_argument("--poll-seconds", type=int, default=5)
     p.add_argument("--timezone", default=os.environ.get("TIMEZONE", "America/New_York")); p.add_argument("--london-start", default=os.environ.get("LONDON_START", "03:00:00")); p.add_argument("--london-end", default=os.environ.get("LONDON_END", "07:00:00")); p.add_argument("--ny-start", default=os.environ.get("NY_START", "07:00:00")); p.add_argument("--ny-end", default=os.environ.get("NY_END", "12:00:00"))
     a = p.parse_args(argv); c = Config(**vars(a)); c.database = str(Path(c.database).expanduser().resolve())
@@ -56,6 +60,10 @@ def parse_config(argv=None):
     if c.login<=0 or not c.password or not c.server: raise SystemExit("MT5_LOGIN, MT5_PASSWORD, and MT5_SERVER environment variables are required")
     if c.pivot != 3 or c.ote != .60 or c.sl != .90 or c.tp != 3.0: raise SystemExit("Frozen strategy parameters must remain Pivot 3 / OTE 0.60 / SL 0.90 / TP 3R")
     if c.risk_percent < 0 or c.lot < 0 or c.max_spread < 0 or c.max_daily_loss < 0 or c.max_open_positions < 1: raise SystemExit("Risk and limits must be non-negative")
+    if c.max_risk_percent <= 0:
+        raise SystemExit("MAX_RISK_PERCENT must be positive")
+    if c.risk_percent > c.max_risk_percent:
+        raise SystemExit("RISK_PERCENT cannot exceed MAX_RISK_PERCENT")
     if c.risk_percent == 0 and c.lot <= 0: raise SystemExit("LOT must be positive when RISK_PERCENT=0")
     try:
         london_start, london_end, ny_start, ny_end = (pd.Timedelta(x) for x in (c.london_start, c.london_end, c.ny_start, c.ny_end))
@@ -174,91 +182,167 @@ def reconcile_closed(client, db):
         audit_row.update(prov); audit_csv(TRADE_CSV,audit_row,TRADE_COLUMNS); db.event('INFO','trade_audit_written',sid)
         logging.info('[EXIT] signal=%s time=%s price=%.5f reason=%s PnL=%.2f',sid,getattr(d,'time',None),price,reason,pnl)
 
-# def risk_volume(c, client, entry, sl):
-#     if c.risk_percent == 0: return c.lot, None, None
-#     acct=client.api.account_info(); equity=float(acct.equity); distance=abs(float(entry)-float(sl)); spec=client.info; tick_size=float(spec.trade_tick_size); tick_value=float(spec.trade_tick_value)
-#     target=equity*c.risk_percent/100.0; raw=target/(distance/tick_size*tick_value); step=float(spec.volume_step); volume=math.floor(raw/step+1e-12)*step
-#     if volume < float(spec.volume_min): raise ValueError("Risk-based volume is below broker minimum")
-#     volume=min(volume,float(spec.volume_max)); estimated=volume*(distance/tick_size*tick_value)
-#     logging.info("risk sizing equity=%.2f requested_pct=%.4f requested_money=%.2f entry=%.5f sl=%.5f distance=%.5f volume=%.4f estimated_money=%.2f",equity,c.risk_percent,target,entry,sl,distance,volume,estimated)
-#     return volume,target,estimated
-
 def risk_volume(c, client, entry, sl):
-    if c.risk_percent == 0:
-        return c.lot, None, None
+    """Size volume at target risk, allowing minimum lot up to the hard risk cap."""
 
-    acct = client.api.account_info()
-    equity = float(acct.equity)
-    target = equity * c.risk_percent / 100.0
+    spec = client.info
+    min_volume = float(spec.volume_min)
+    max_volume = float(spec.volume_max)
+    step = float(spec.volume_step)
 
-    # Determine trade direction from entry and stop loss.
-    # This assumes SL is below entry for BUY and above entry for SELL.
+    if not all(math.isfinite(v) and v > 0
+               for v in (min_volume, max_volume, step)):
+        raise ValueError("Invalid broker volume specification")
+
+    if min_volume > max_volume:
+        raise ValueError("Invalid broker volume limits")
+
+    entry = float(entry)
+    sl = float(sl)
+
+    if not math.isfinite(entry) or not math.isfinite(sl) or entry == sl:
+        raise ValueError("Invalid entry or stop loss")
+
+    account = client.api.account_info()
+    if account is None:
+        raise ValueError("Could not read account information")
+
+    equity = float(account.equity)
+    if not math.isfinite(equity) or equity <= 0:
+        raise ValueError("Invalid account equity")
+
+    max_risk_money = equity * c.max_risk_percent / 100.0
+
     order_type = (
         client.api.ORDER_TYPE_BUY
-        if float(sl) < float(entry)
+        if sl < entry
         else client.api.ORDER_TYPE_SELL
     )
 
-    # Calculate actual monetary loss for 1 lot using MT5.
-    one_lot_profit = client.api.order_calc_profit(
-        order_type,
-        c.symbol,
-        1.0,
-        float(entry),
-        float(sl)
-    )
-
-    if one_lot_profit is None:
-        raise ValueError(
-            f"MT5 profit calculation failed: {client.api.last_error()}"
+    def calculate_risk(volume):
+        result = client.api.order_calc_profit(
+            order_type, c.symbol, volume, entry, sl
         )
 
-    loss_per_lot = abs(float(one_lot_profit))
+        if result is None:
+            raise ValueError(
+                f"MT5 risk calculation failed: {client.api.last_error()}"
+            )
 
-    if loss_per_lot <= 0:
-        raise ValueError("Invalid loss per lot")
+        result = float(result)
 
-    raw = target / loss_per_lot
+        if not math.isfinite(result) or result >= 0:
+            raise ValueError("Invalid MT5 stop-loss calculation")
 
-    # Round down to broker volume step.
-    spec = client.info
-    step = float(spec.volume_step)
+        return abs(result)
 
-    volume = math.floor(raw / step + 1e-12) * step
+    # Find the smallest broker-valid volume.
+    min_valid = math.ceil(min_volume / step - 1e-10) * step
+    max_valid = math.floor(max_volume / step + 1e-10) * step
 
-    if volume < float(spec.volume_min):
-        raise ValueError(
-            "Risk-based volume is below broker minimum"
-        )
+    if min_valid > max_valid:
+        raise ValueError("No valid broker volume available")
 
-    volume = min(volume, float(spec.volume_max))
+    # Fixed-lot mode: retain the configured lot, but enforce the hard cap.
+    if c.risk_percent == 0:
+        volume = float(c.lot)
 
-    # Recalculate estimated loss using actual rounded volume.
-    estimated_profit = client.api.order_calc_profit(
-        order_type,
-        c.symbol,
-        volume,
-        float(entry),
-        float(sl)
+        if not math.isfinite(volume) or volume <= 0:
+            raise ValueError("Invalid fixed lot")
+
+        units = volume / step
+        if not math.isclose(units, round(units), abs_tol=1e-8):
+            raise ValueError("Fixed lot does not match broker volume step")
+
+        if volume < min_valid or volume > max_valid:
+            raise ValueError("Fixed lot outside broker volume limits")
+
+        estimated = calculate_risk(volume)
+
+        if estimated > max_risk_money:
+            raise ValueError(
+                f"Fixed lot risk {estimated:.2f} exceeds maximum "
+                f"{max_risk_money:.2f}"
+            )
+
+        return volume, None, estimated
+
+    if c.risk_percent <= 0 or c.risk_percent > c.max_risk_percent:
+        raise ValueError("Invalid target or maximum risk percentage")
+
+    target_risk_money = equity * c.risk_percent / 100.0
+
+    # Calculate the monetary risk of one lot.
+    loss_per_lot = calculate_risk(1.0)
+
+    raw_volume = target_risk_money / loss_per_lot
+
+    if not math.isfinite(raw_volume) or raw_volume <= 0:
+        raise ValueError("Invalid calculated volume")
+
+
+    # Find the valid broker volume immediately below and above target.
+    lower_volume = math.floor(raw_volume / step + 1e-10) * step
+    upper_volume = lower_volume + step
+
+    lower_volume = min(lower_volume, max_valid)
+    upper_volume = min(upper_volume, max_valid)
+
+    # If target is below broker minimum, minimum valid volume is the
+    # only available candidate.
+    if lower_volume < min_valid:
+        lower_volume = None
+        upper_volume = min_valid
+
+    lower_risk = (
+        calculate_risk(lower_volume)
+        if lower_volume is not None
+        else None
     )
 
-    if estimated_profit is None:
-        raise ValueError("Final risk calculation failed")
+    upper_risk = (
+        calculate_risk(upper_volume)
+        if upper_volume is not None
+        else None
+    )
 
-    estimated = abs(float(estimated_profit))
+    # Prefer reaching target only when the next volume stays STRICTLY
+    # below the maximum risk. Otherwise use the lower volume.
+    if upper_risk is not None and upper_risk < max_risk_money:
+        volume = upper_volume
+        estimated_risk = upper_risk
 
-    if estimated > target:
-        raise ValueError("Estimated risk exceeds target")
+    elif lower_volume is not None and lower_risk <= max_risk_money:
+        volume = lower_volume
+        estimated_risk = lower_risk
+
+    else:
+        raise ValueError(
+            "No valid broker volume can satisfy the maximum risk limit"
+        )
+
+
+    # Minimum lot may exceed target, but must never exceed hard maximum.
+    if estimated_risk > max_risk_money:
+        raise ValueError(
+            f"Minimum valid volume would risk {estimated_risk:.2f}, "
+            f"above maximum allowed {max_risk_money:.2f}"
+        )
 
     logging.info(
-        "risk sizing equity=%.2f requested_pct=%.4f "
-        "requested_money=%.2f entry=%.5f sl=%.5f "
-        "loss_per_lot=%.2f volume=%.4f estimated_money=%.2f",
-        equity, c.risk_percent, target,
-        entry, sl, loss_per_lot, volume, estimated
+        "risk sizing equity=%.2f target_pct=%.2f target_money=%.2f "
+        "maximum_pct=%.2f maximum_money=%.2f volume=%.4f "
+        "estimated_risk=%.2f",
+        equity,
+        c.risk_percent,
+        target_risk_money,
+        c.max_risk_percent,
+        max_risk_money,
+        volume,
+        estimated_risk
     )
 
-    return volume, target, estimated
+    return volume, target_risk_money, estimated_risk
 
 def check_margin(client, symbol, order_type, volume, entry):
     account = client.api.account_info()
