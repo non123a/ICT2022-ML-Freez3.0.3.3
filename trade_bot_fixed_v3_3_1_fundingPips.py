@@ -11,9 +11,9 @@ from pathlib import Path
 import pandas as pd
 
 HERE = Path(__file__).resolve().parent
-LOG = HERE / "trade_bot_fundingPips.log"
+LOG = HERE / "trade_bot.log"
 TRADE_CSV = HERE / "trade_audit.csv"
-SETUP_CSV = HERE / "setup_events_fundingPips.csv"
+SETUP_CSV = HERE / "setup_events.csv"
 SL_BUFFER_POINTS = 0.00010
 LAST_EXECUTION = {'state': 'IDLE', 'reason': ''}
 LAST_COMPLETED_POSITION = None
@@ -30,7 +30,6 @@ class Config:
     tp: float = 3.0
     lot: float = .01
     risk_percent: float = 0.0
-    max_risk_percent: float = 3.0
     magic: int = 20260906
     max_spread: float = 0.0
     max_daily_loss: float = 0.0
@@ -49,10 +48,7 @@ def parse_config(argv=None):
     # supplied by BAT environment variables and never accepted as CLI args.
     p.add_argument("--login", type=int, default=int(os.environ.get("MT5_LOGIN", "0") or 0)); p.add_argument("--server", default=os.environ.get("MT5_SERVER", ""))
     p.add_argument("--symbol", default="XAUUSD"); p.add_argument("--pivot", type=int, default=3); p.add_argument("--ote", type=float, default=.60); p.add_argument("--sl", type=float, default=.90); p.add_argument("--tp", type=float, default=3.0)
-    p.add_argument("--lot", type=float, default=.01)
-    p.add_argument("--risk-percent", type=float, default=float(os.environ.get("RISK_PERCENT", "0")))
-    p.add_argument("--max-risk-percent", type=float, default=float(os.environ.get("MAX_RISK_PERCENT", "3.0")))
-    p.add_argument("--magic", type=int, default=20260906)
+    p.add_argument("--lot", type=float, default=.01); p.add_argument("--risk-percent", type=float, default=0.0); p.add_argument("--magic", type=int, default=20260906)
     p.add_argument("--max-spread", type=float, default=0.0); p.add_argument("--max-daily-loss", type=float, default=0.0); p.add_argument("--max-open-positions", type=int, default=1); p.add_argument("--database", default=str(HERE / "paper_trades.sqlite3")); p.add_argument("--poll-seconds", type=int, default=5)
     p.add_argument("--timezone", default=os.environ.get("TIMEZONE", "America/New_York")); p.add_argument("--london-start", default=os.environ.get("LONDON_START", "03:00:00")); p.add_argument("--london-end", default=os.environ.get("LONDON_END", "07:00:00")); p.add_argument("--ny-start", default=os.environ.get("NY_START", "07:00:00")); p.add_argument("--ny-end", default=os.environ.get("NY_END", "12:00:00"))
     a = p.parse_args(argv); c = Config(**vars(a)); c.database = str(Path(c.database).expanduser().resolve())
@@ -60,10 +56,6 @@ def parse_config(argv=None):
     if c.login<=0 or not c.password or not c.server: raise SystemExit("MT5_LOGIN, MT5_PASSWORD, and MT5_SERVER environment variables are required")
     if c.pivot != 3 or c.ote != .60 or c.sl != .90 or c.tp != 3.0: raise SystemExit("Frozen strategy parameters must remain Pivot 3 / OTE 0.60 / SL 0.90 / TP 3R")
     if c.risk_percent < 0 or c.lot < 0 or c.max_spread < 0 or c.max_daily_loss < 0 or c.max_open_positions < 1: raise SystemExit("Risk and limits must be non-negative")
-    if c.max_risk_percent <= 0:
-        raise SystemExit("MAX_RISK_PERCENT must be positive")
-    if c.risk_percent > c.max_risk_percent:
-        raise SystemExit("RISK_PERCENT cannot exceed MAX_RISK_PERCENT")
     if c.risk_percent == 0 and c.lot <= 0: raise SystemExit("LOT must be positive when RISK_PERCENT=0")
     try:
         london_start, london_end, ny_start, ny_end = (pd.Timedelta(x) for x in (c.london_start, c.london_end, c.ny_start, c.ny_end))
@@ -183,197 +175,13 @@ def reconcile_closed(client, db):
         logging.info('[EXIT] signal=%s time=%s price=%.5f reason=%s PnL=%.2f',sid,getattr(d,'time',None),price,reason,pnl)
 
 def risk_volume(c, client, entry, sl):
-    """Size volume at target risk, allowing minimum lot up to the hard risk cap."""
-
-    spec = client.info
-    min_volume = float(spec.volume_min)
-    max_volume = float(spec.volume_max)
-    step = float(spec.volume_step)
-
-    if not all(math.isfinite(v) and v > 0
-               for v in (min_volume, max_volume, step)):
-        raise ValueError("Invalid broker volume specification")
-
-    if min_volume > max_volume:
-        raise ValueError("Invalid broker volume limits")
-
-    entry = float(entry)
-    sl = float(sl)
-
-    if not math.isfinite(entry) or not math.isfinite(sl) or entry == sl:
-        raise ValueError("Invalid entry or stop loss")
-
-    account = client.api.account_info()
-    if account is None:
-        raise ValueError("Could not read account information")
-
-    equity = float(account.equity)
-    if not math.isfinite(equity) or equity <= 0:
-        raise ValueError("Invalid account equity")
-
-    max_risk_money = equity * c.max_risk_percent / 100.0
-
-    order_type = (
-        client.api.ORDER_TYPE_BUY
-        if sl < entry
-        else client.api.ORDER_TYPE_SELL
-    )
-
-    def calculate_risk(volume):
-        result = client.api.order_calc_profit(
-            order_type, c.symbol, volume, entry, sl
-        )
-
-        if result is None:
-            raise ValueError(
-                f"MT5 risk calculation failed: {client.api.last_error()}"
-            )
-
-        result = float(result)
-
-        if not math.isfinite(result) or result >= 0:
-            raise ValueError("Invalid MT5 stop-loss calculation")
-
-        return abs(result)
-
-    # Find the smallest broker-valid volume.
-    min_valid = math.ceil(min_volume / step - 1e-10) * step
-    max_valid = math.floor(max_volume / step + 1e-10) * step
-
-    if min_valid > max_valid:
-        raise ValueError("No valid broker volume available")
-
-    # Fixed-lot mode: retain the configured lot, but enforce the hard cap.
-    if c.risk_percent == 0:
-        volume = float(c.lot)
-
-        if not math.isfinite(volume) or volume <= 0:
-            raise ValueError("Invalid fixed lot")
-
-        units = volume / step
-        if not math.isclose(units, round(units), abs_tol=1e-8):
-            raise ValueError("Fixed lot does not match broker volume step")
-
-        if volume < min_valid or volume > max_valid:
-            raise ValueError("Fixed lot outside broker volume limits")
-
-        estimated = calculate_risk(volume)
-
-        if estimated > max_risk_money:
-            raise ValueError(
-                f"Fixed lot risk {estimated:.2f} exceeds maximum "
-                f"{max_risk_money:.2f}"
-            )
-
-        return volume, None, estimated
-
-    if c.risk_percent <= 0 or c.risk_percent > c.max_risk_percent:
-        raise ValueError("Invalid target or maximum risk percentage")
-
-    target_risk_money = equity * c.risk_percent / 100.0
-
-    # Calculate the monetary risk of one lot.
-    loss_per_lot = calculate_risk(1.0)
-
-    raw_volume = target_risk_money / loss_per_lot
-
-    if not math.isfinite(raw_volume) or raw_volume <= 0:
-        raise ValueError("Invalid calculated volume")
-
-
-    # Find the valid broker volume immediately below and above target.
-    lower_volume = math.floor(raw_volume / step + 1e-10) * step
-    upper_volume = lower_volume + step
-
-    lower_volume = min(lower_volume, max_valid)
-    upper_volume = min(upper_volume, max_valid)
-
-    # If target is below broker minimum, minimum valid volume is the
-    # only available candidate.
-    if lower_volume < min_valid:
-        lower_volume = None
-        upper_volume = min_valid
-
-    lower_risk = (
-        calculate_risk(lower_volume)
-        if lower_volume is not None
-        else None
-    )
-
-    upper_risk = (
-        calculate_risk(upper_volume)
-        if upper_volume is not None
-        else None
-    )
-
-    # Prefer reaching target only when the next volume stays STRICTLY
-    # below the maximum risk. Otherwise use the lower volume.
-    if upper_risk is not None and upper_risk < max_risk_money:
-        volume = upper_volume
-        estimated_risk = upper_risk
-
-    elif lower_volume is not None and lower_risk <= max_risk_money:
-        volume = lower_volume
-        estimated_risk = lower_risk
-
-    else:
-        raise ValueError(
-            "No valid broker volume can satisfy the maximum risk limit"
-        )
-
-
-    # Minimum lot may exceed target, but must never exceed hard maximum.
-    if estimated_risk > max_risk_money:
-        raise ValueError(
-            f"Minimum valid volume would risk {estimated_risk:.2f}, "
-            f"above maximum allowed {max_risk_money:.2f}"
-        )
-
-    logging.info(
-        "risk sizing equity=%.2f target_pct=%.2f target_money=%.2f "
-        "maximum_pct=%.2f maximum_money=%.2f volume=%.4f "
-        "estimated_risk=%.2f",
-        equity,
-        c.risk_percent,
-        target_risk_money,
-        c.max_risk_percent,
-        max_risk_money,
-        volume,
-        estimated_risk
-    )
-
-    return volume, target_risk_money, estimated_risk
-
-def check_margin(client, symbol, order_type, volume, entry):
-    account = client.api.account_info()
-
-    required_margin = client.api.order_calc_margin(
-        order_type,
-        symbol,
-        volume,
-        entry
-    )
-
-    if required_margin is None:
-        raise ValueError("Could not calculate required margin")
-
-    free_margin = float(account.margin_free)
-
-    # Keep at least 20% of free margin unused
-    if required_margin > free_margin * 0.80:
-        raise ValueError(
-            f"Insufficient free margin: "
-            f"required={required_margin:.2f}, "
-            f"free={free_margin:.2f}"
-        )
-
-    logging.info(
-        "margin_check=PASS required=%.2f free=%.2f",
-        required_margin,
-        free_margin
-    )
-
-    return True
+    if c.risk_percent == 0: return c.lot, None, None
+    acct=client.api.account_info(); equity=float(acct.equity); distance=abs(float(entry)-float(sl)); spec=client.info; tick_size=float(spec.trade_tick_size); tick_value=float(spec.trade_tick_value)
+    target=equity*c.risk_percent/100.0; raw=target/(distance/tick_size*tick_value); step=float(spec.volume_step); volume=math.floor(raw/step+1e-12)*step
+    if volume < float(spec.volume_min): raise ValueError("Risk-based volume is below broker minimum")
+    volume=min(volume,float(spec.volume_max)); estimated=volume*(distance/tick_size*tick_value)
+    logging.info("risk sizing equity=%.2f requested_pct=%.4f requested_money=%.2f entry=%.5f sl=%.5f distance=%.5f volume=%.4f estimated_money=%.2f",equity,c.risk_percent,target,entry,sl,distance,volume,estimated)
+    return volume,target,estimated
 
 def signal_id(symbol, row): return "SIG-" + hashlib.sha256(f"{symbol}|{row['timestamp']}|{row['side']}|P3-O60-S090-T300".encode()).hexdigest()[:24]
 def load_csv(path):
@@ -460,67 +268,13 @@ def _setup_diagnostics(s, c=None):
             'risk_ok': s.get('risk_ok', 'NONE'),
             'entry_rejection_reason': s.get('entry_rejection_reason', ''),
             }
-def find_reset_crossing(direction, candles, sweep_price, exit_time):
-    """
-    Find the first wick-based crossing beyond the original
-    London sweep extreme, strictly after the invalidation candle.
-
-    BUY setup: price trades below the original London low sweep.
-    SELL setup: price trades above the original London high sweep.
-    """
-    if direction not in ('long', 'short'):
-        raise ValueError(f"Invalid direction: {direction}")
-
-    sweep_price = float(sweep_price)
-
-    # Do not inspect the invalidation candle itself:
-    # M1 data cannot establish the order of events within that candle.
-    candles = candles.loc[candles.index > exit_time]
-
-    for t, r in candles.iterrows():
-        if direction == 'long' and float(r.Low) < sweep_price:
-            return t
-
-        if direction == 'short' and float(r.High) > sweep_price:
-            return t
-
-    return None
-def first_exit(direction, candles, sl, tp):
-    """
-    Check whether original SL or TP was touched after setup formation.
-
-    Returns:
-        (timestamp, price, result)
-        result = 'sl', 'tp', 'ambiguous', or None
-    """
-    if direction not in ('long', 'short'):
-        raise ValueError(f"Invalid direction: {direction}")
-
-    sl = float(sl)
-    tp = float(tp)
-
-    for t, r in candles.iterrows():
-        high = float(r.High)
-        low = float(r.Low)
-
-        if direction == 'long':
-            hit_sl = low <= sl
-            hit_tp = high >= tp
-        else:
-            hit_sl = high >= sl
-            hit_tp = low <= tp
-
-        if hit_sl and hit_tp:
-            return t, None, 'ambiguous'
-
-        if hit_sl:
-            return t, sl, 'sl'
-
-        if hit_tp:
-            return t, tp, 'tp'
-
-    return None, None, None
-
+def first_exit(direction, candles, entry_or_sl, sl_or_tp, tp=None):
+    sl, tp = (sl_or_tp, tp) if tp is not None else (entry_or_sl, sl_or_tp)
+    for t,r in candles.iterrows():
+        hit_sl=(float(r.High)>=sl) if direction=='short' else (float(r.Low)<=sl)
+        hit_tp=(float(r.Low)<=tp) if direction=='short' else (float(r.High)>=tp)
+        if hit_sl or hit_tp: return t, (sl if hit_sl else tp), ('sl' if hit_sl else 'tp')
+    return None,None,None
 def phase27_live_state(df,c):
     """One causal Phase 27 state machine for both status and executable signal.
 
@@ -633,137 +387,29 @@ def phase27_live_state(df,c):
                             (direction, s, entry, sl, tp, structural_stop, risk, trend)
                         )
             if candidates:
-                # Preserve Phase 27 bearish-first candidate selection.
-                direction, s, entry, sl, tp, structural_stop, risk, trend = candidates[0]
-
-                provenance = {
-                    'london_high': lh,
-                    'london_high_time': lh_time,
-                    'london_low': ll,
-                    'london_low_time': ll_time,
-                    'sweep_type': 'HIGH' if direction == 'short' else 'LOW',
-
-                    # Original London liquidity sweep extreme.
-                    'sweep_price': float(s['sweep_price']),
-
-                    'sweep_time': str(s['sweep']),
-                    'swept_level': lh if direction == 'short' else ll,
-                    'bos_direction': direction,
-                    'bos_price': float(s['bos_price']),
-                    'bos_time': str(s['bos']),
-                    'bos_broken_level': s['broken']['value'],
-                    'ote_anchor_1': s['anchor_pivot']['value'],
-                    'ote_anchor_1_time': str(s['anchor_pivot']['center']),
-                    'ote_anchor_2': s['extreme'],
-                    'ote_anchor_2_time': str(s['retrace']),
-                    'ote_calculation_method': 'phase27_anchor_extreme_retrace_frozen_at_first_touch',
-                    'ote_ratio': c.ote,
-                    'ote_effective_retracement': 1.0 - c.ote,
-                    'ote_price': s['ote'],
-                    'ote_touch_price': float(row.High if direction == 'short' else row.Low),
-                    'ote_touch_time': str(s['retrace']),
-                    'pivot_confirmation': str(s['anchor_pivot']['confirmation']),
-                    'pivot_level': s['anchor_pivot']['value'],
-                    'bos_pivot_confirmation': str(s['broken']['confirmation']),
-                    'bos_pivot_level': s['broken']['value'],
-                    'structural_stop_reference': structural_stop,
-                    'trend_direction': trend,
-                    'displacement_confirmation': ''
-                }
-
-                signal = {
-                    'timestamp': t,
-                    'side': direction,
-                    'entry': entry,
-                    'sl': sl,
-                    'tp': tp,
-                    'risk_distance': risk,
-                    'provenance': provenance
-                }
-
-                diagnostics = {
-                    'timestamp': newest,
-                    'current_price': float(df.iloc[-1].Close),
-                    'session': cycle_session,
-                    'london': {
-                        'high': lh,
-                        'high_time': lh_time,
-                        'low': ll,
-                        'low_time': ll_time
-                    },
-                    'short': _setup_diagnostics(side['short'], c),
-                    'long': _setup_diagnostics(side['long'])
-                }
-
-                if t == newest:
-                    completed = True
-                    return {
-                        'timestamp': newest,
-                        'state': 'ENTRY_SIGNAL',
-                        'signal': signal,
-                        'recovery': None,
-                        'diagnostics': diagnostics
-                    }
-
-                # Candidate formed on an earlier candle.
-                # Only inspect candles strictly after its formation.
-                future_candles = df.loc[df.index > t]
-
-                exit_time, exit_price, exit_result = first_exit(
-                    direction,
-                    future_candles,
-                    sl,
-                    tp
-                )
-
-                if exit_result is None:
-                    completed = True
-                    return {
-                        'timestamp': newest,
-                        'state': 'RECOVERY_PENDING',
-                        'signal': None,
-                        'recovery': signal,
-                        'diagnostics': diagnostics
-                    }
-
-                # Original SL/TP was reached. Find the later London sweep reset.
-                sweep_price = float(provenance['sweep_price'])
-
-                reset_time = find_reset_crossing(
-                    direction,
-                    df,
-                    sweep_price,
-                    exit_time
-                )
-
-                completed = True
-
-                if reset_time is None:
-                    return {
-                        'timestamp': newest,
-                        'state': 'WAITING_RESET',
-                        'signal': None,
-                        'recovery': None,
-                        'exit_time': exit_time,
-                        'exit_price': exit_price,
-                        'exit_result': exit_result,
-                        'reset_time': None,
-                        'reset_price': sweep_price,
-                        'diagnostics': diagnostics
-                    }
-
-                return {
-                    'timestamp': newest,
-                    'state': 'RESET_CONFIRMED',
-                    'signal': None,
-                    'recovery': None,
-                    'exit_time': exit_time,
-                    'exit_price': exit_price,
-                    'exit_result': exit_result,
-                    'reset_time': reset_time,
-                    'reset_price': sweep_price,
-                    'diagnostics': diagnostics
-                }
+                # Phase 27 runs bearish processing before bullish processing on a shared candle.
+                direction,s,entry,sl,tp,structural_stop,risk,trend=candidates[0]
+                provenance={'london_high':lh,'london_high_time':lh_time,'london_low':ll,'london_low_time':ll_time,'sweep_type':'HIGH' if direction=='short' else 'LOW','sweep_price':float(row.High if direction=='short' else row.Low),'sweep_time':str(s['sweep']),'swept_level':lh if direction=='short' else ll,'bos_direction':direction,'bos_price':float(row.Close),'bos_time':str(s['bos']),'bos_broken_level':s['broken']['value'],'ote_anchor_1':s['anchor_pivot']['value'],'ote_anchor_1_time':str(s['anchor_pivot']['center']),'ote_anchor_2':s['extreme'],'ote_anchor_2_time':str(s['retrace']),'ote_calculation_method':'phase27_anchor_extreme_retrace_frozen_at_first_touch','ote_ratio':c.ote,'ote_effective_retracement':1.0-c.ote,'ote_price':s['ote'],'ote_touch_price':float(row.High if direction=='short' else row.Low),'ote_touch_time':str(s['retrace']),'pivot_confirmation':str(s['anchor_pivot']['confirmation']),'pivot_level':s['anchor_pivot']['value'],'bos_pivot_confirmation':str(s['broken']['confirmation']),'bos_pivot_level':s['broken']['value'],'structural_stop_reference':structural_stop,'trend_direction':trend,'displacement_confirmation':''}
+                signal={'timestamp':t,'side':direction,'entry':entry,'sl':sl,'tp':tp,'risk_distance':risk,'provenance':provenance}
+                completed=True
+                diagnostics={'timestamp':newest,'current_price':float(df.iloc[-1].Close),'session':cycle_session,'london':{'high':lh,'high_time':lh_time,'low':ll,'low_time':ll_time},'short':_setup_diagnostics(side['short'],c), 'long':_setup_diagnostics(side['long'],c)}
+                if t==newest: return {'timestamp':newest,'state':'ENTRY_SIGNAL','signal':signal,'diagnostics':diagnostics}
+                latest_state={'timestamp':newest,'state':'SIGNAL_COMPLETED','signal':None,'diagnostics':diagnostics}
+            elif t==newest:
+                if not any(x['sweep'] for x in side.values()):
+                    stage = 'WAITING_SWEEP'
+                elif not any(x['bos'] for x in side.values()):
+                    stage = 'WAITING_BOS'
+                elif not any(x['retrace'] for x in side.values()):
+                    stage = 'WAITING_FIRST_OTE_TOUCH'
+                elif any(
+                    x.get('second_touch')
+                    and x.get('risk_ok') is False
+                    for x in side.values()
+                ):
+                    stage = 'SECOND_TOUCH_RISK_FILTER_FAILED'
+                else:
+                    stage = 'WAITING_ENTRY_TOUCH'
                 latest_state={'timestamp':newest,'state':stage,'signal':None,'diagnostics':{'timestamp':newest,'current_price':float(row.Close),'session':cycle_session,'london':{'high':lh,'high_time':lh_time,'low':ll,'low_time':ll_time},'short':_setup_diagnostics(side['short'],c), 'long':_setup_diagnostics(side['long'],c)}}
     return latest_state
 
@@ -771,59 +417,6 @@ def run_strategy(df,c):
     """Compatibility adapter: only return a signal made by the newest closed bar."""
     state=phase27_live_state(df,c)
     return [state['signal']] if state['signal'] is not None else []
-
-def recovery_entry_status(row, bid, ask):
-    """
-    Check whether a recovered setup is waiting for its original entry,
-    ready for market execution, or invalidated.
-
-    Uses executable quotes:
-      BUY  -> Ask
-      SELL -> Bid
-    """
-    side = row['side']
-    entry = float(row['entry'])
-    sl = float(row['sl'])
-    tp = float(row['tp'])
-
-    bid = float(bid)
-    ask = float(ask)
-
-    if not all(math.isfinite(x) and x > 0
-               for x in (entry, sl, tp, bid, ask)):
-        return 'INVALID', 'invalid_price'
-
-    if side == 'long':
-        if not sl < entry < tp:
-            return 'INVALID', 'invalid_buy_levels'
-
-        if ask <= sl:
-            return 'INVALID', 'original_sl_reached'
-
-        if ask >= tp:
-            return 'INVALID', 'original_tp_reached'
-
-        if ask <= entry:
-            return 'READY', 'original_entry_reached'
-
-        return 'WAITING', 'waiting_for_buy_retrace'
-
-    elif side == 'short':
-        if not tp < entry < sl:
-            return 'INVALID', 'invalid_sell_levels'
-
-        if bid >= sl:
-            return 'INVALID', 'original_sl_reached'
-
-        if bid <= tp:
-            return 'INVALID', 'original_tp_reached'
-
-        if bid >= entry:
-            return 'READY', 'original_entry_reached'
-
-        return 'WAITING', 'waiting_for_sell_retrace'
-
-    return 'INVALID', 'unknown_direction'
 
 def _fmt(v):
     if v is None or v == 'NONE': return 'NONE/WAITING'
@@ -872,28 +465,8 @@ def position_snapshot(client, db=None):
         return LAST_COMPLETED_POSITION or {'status':'NONE'}
     p=positions[0]
     return {'status':'POSITION OPEN','direction':getattr(p,'type','UNKNOWN'),'ticket':getattr(p,'ticket','NONE'),'entry_price':getattr(p,'price_open','NONE'),'sl':getattr(p,'sl','NONE'),'tp':getattr(p,'tp','NONE'),'volume':getattr(p,'volume','NONE'),'open_time':getattr(p,'time','UNKNOWN')}
-def monitor_recovery_entry(client, row):
-    """
-    Check a recovered setup against the latest executable quote.
 
-    Returns:
-        (status, reason, bid, ask)
-    """
-    tick = client.api.symbol_info_tick(client.symbol)
-
-    if tick is None:
-        return 'WAITING', 'missing_tick', None, None
-
-    bid = float(getattr(tick, 'bid', 0) or 0)
-    ask = float(getattr(tick, 'ask', 0) or 0)
-
-    if bid <= 0 or ask <= 0 or ask < bid:
-        return 'WAITING', 'invalid_tick', bid, ask
-
-    status, reason = recovery_entry_status(row, bid, ask)
-
-    return status, reason, bid, ask
-def execute_signal(c,client,db,row,fixed_levels=False):
+def execute_signal(c,client,db,row):
     sid=signal_id(client.symbol,row)
     def reject(reason, details=""):
         LAST_EXECUTION.update(state='ENTRY_REJECTED', reason=reason)
@@ -925,31 +498,8 @@ def execute_signal(c,client,db,row,fixed_levels=False):
         return reject('SPREAD',f'spread={spread}')
     logging.info('[EXECUTION_CHECK] spread=PASS value=%s limit=%s',spread,c.max_spread)
     entry=ask if row['side']=='long' else bid
-
-    if fixed_levels:
-        # Recovered setup: preserve its original strategy SL and TP.
-        sl=float(row['sl'])
-        tp=float(row['tp'])
-        structural_stop=float(
-            row['provenance'].get('structural_stop_reference', sl)
-        )
-        risk_distance=abs(entry-sl)
-
-        # Do not chase the original entry.
-        if row['side']=='long':
-            if not sl < entry <= float(row['entry']):
-                return reject('RECOVERY_ENTRY_PRICE_OUTSIDE_VALID_ZONE')
-        else:
-            if not float(row['entry']) <= entry < sl:
-                return reject('RECOVERY_ENTRY_PRICE_OUTSIDE_VALID_ZONE')
-
-    else:
-        # Normal setup: retain the existing live-price calculation.
-        anchor=float(row['provenance']['ote_anchor_1'])
-        sl,tp,structural_stop,risk_distance=construct_phase27_order(
-            row['side'],entry,anchor,c.sl,c.tp
-        )
-
+    anchor=float(row['provenance']['ote_anchor_1'])
+    sl,tp,structural_stop,risk_distance=construct_phase27_order(row['side'],entry,anchor,c.sl,c.tp)
     geometry_ok=(sl<entry<tp) if row['side']=='long' else (tp<entry<sl)
     if not geometry_ok:
         logging.info('[EXECUTION_CHECK] geometry=FAIL strategy_entry=%.5f execution_price=%.5f sl=%.5f tp=%.5f',row['entry'],entry,sl,tp)
@@ -974,34 +524,7 @@ def execute_signal(c,client,db,row,fixed_levels=False):
     audit_csv(SETUP_CSV,setup_payload(live_row,timestamp=row['timestamp'],signal_id=sid,event_type='ENTRY_ALLOWED',symbol=client.symbol,direction=row['side'],price=entry,level=sl,reason='pretrade checks passed',state='order_pending'),SETUP_COLUMNS)
     db.signal((sid,str(row['timestamp']),client.symbol,row['side'],entry,sl,tp,'PENDING',json.dumps(live_provenance,default=str)))
     typ=client.api.ORDER_TYPE_BUY if row['side']=='long' else client.api.ORDER_TYPE_SELL
-    # req={'action':client.api.TRADE_ACTION_DEAL,'symbol':client.symbol,'volume':volume,'type':typ,'price':entry,'sl':sl,'tp':tp,'deviation':20,'magic':c.magic,'comment':sid,'type_time':client.api.ORDER_TIME_GTC,'type_filling':client.api.ORDER_FILLING_IOC}
-    # logging.info('[MT5_ORDER_REQUEST] symbol=%s direction=%s volume=%.4f price=%.5f sl=%.5f tp=%.5f magic=%s deviation=%s filling=%s',client.symbol,row['side'],volume,entry,sl,tp,c.magic,req['deviation'],req['type_filling'])
-    # result=client.api.order_send(req)
     req={'action':client.api.TRADE_ACTION_DEAL,'symbol':client.symbol,'volume':volume,'type':typ,'price':entry,'sl':sl,'tp':tp,'deviation':20,'magic':c.magic,'comment':sid,'type_time':client.api.ORDER_TIME_GTC,'type_filling':client.api.ORDER_FILLING_IOC}
-    # Check available margin before sending the order
-        # Check available margin before sending the order
-    try:
-        margin = client.api.order_calc_margin(typ, client.symbol, volume, entry)
-        account = client.api.account_info()
-
-        if margin is None or account is None:
-            return reject('MARGIN_CHECK_FAILED', 'Could not calculate margin')
-
-        margin = float(margin)
-        free_margin = float(account.margin_free)
-
-        if not math.isfinite(margin) or margin < 0 or not math.isfinite(free_margin):
-            return reject('MARGIN_CHECK_FAILED', 'Invalid margin values')
-
-        if margin > free_margin * 0.80:
-            return reject('INSUFFICIENT_MARGIN', f'required={margin:.2f} free={free_margin:.2f}')
-
-        logging.info('[EXECUTION_CHECK] margin=PASS required=%.2f free=%.2f', margin, free_margin)
-
-    except Exception as e:
-        logging.exception('Margin check error')
-        return reject('MARGIN_CHECK_ERROR', str(e))
-
     logging.info('[MT5_ORDER_REQUEST] symbol=%s direction=%s volume=%.4f price=%.5f sl=%.5f tp=%.5f magic=%s deviation=%s filling=%s',client.symbol,row['side'],volume,entry,sl,tp,c.magic,req['deviation'],req['type_filling'])
     result=client.api.order_send(req)
     if result is None:
