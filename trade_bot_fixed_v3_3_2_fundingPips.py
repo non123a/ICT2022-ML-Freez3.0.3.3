@@ -1288,13 +1288,48 @@ def execute_signal(c,client,db,row,fixed_levels=False):
 def main():
     c=parse_config(); setup_logging(); db=Database(c.database); logging.info('ACCOUNT=%s SERVER=%s SYMBOL=%s PIVOT=3 OTE=.60 SL=.90 TP=3 RISK_PERCENT=%s LOT=%s MAGIC=%s MAX_SPREAD=%s MAX_DAILY_LOSS=%s MAX_OPEN_POSITIONS=%s TIMEZONE=%s LONDON=%s-%s NY=%s-%s DB=%s',c.login,c.server,c.symbol,c.risk_percent,c.lot,c.magic,c.max_spread,c.max_daily_loss,c.max_open_positions,c.timezone,c.london_start,c.london_end,c.ny_start,c.ny_end,c.database); logging.info('OTE_PARAMETER=%.2f EFFECTIVE_RETRACEMENT=%.2f',c.ote,1.0-c.ote); logging.info('[LONDON]/[SWEEP]/[BOS]/[OTE]/[ENTRY_SIGNAL]/[ENTRY]/[EXIT]/[REJECTED]/[ERROR] event labels enabled; password intentionally omitted')
     client=MT5Client(c); client.connect(); reconcile_closed(client,db); logging.info('LIVE MT5 BOT ENABLED — REAL ORDERS MAY BE SENT')
-    # last=None
-    # while True:
     last = None
     pending_recovery = None
+    pending_entry = None
     attempted_recoveries = set()
     while True:
         try:
+
+           
+            # Fast monitoring only while a normal entry is armed.
+            # Do not recalculate the strategy or fetch M1 history here.
+            if pending_entry is not None:
+                status, reason, bid, ask = monitor_recovery_entry(
+                    client, pending_entry
+                )
+
+                if status == 'READY':
+                    row = pending_entry
+                    pending_entry = None
+
+                    logging.info(
+                        '[ENTRY] price reached calculated entry '
+                        'reason=%s bid=%s ask=%s',
+                        reason, bid, ask
+                    )
+
+                    execute_signal(
+                        c, client, db, row,
+                        fixed_levels=True
+                    )
+
+                    continue
+
+                elif status == 'INVALID':
+                    logging.info(
+                        '[ENTRY] candidate invalidated reason=%s',
+                        reason
+                    )
+                    pending_entry = None
+                    continue
+
+                time.sleep(0.25)
+                continue
             rates=client.rates()
             if rates is None or len(rates)<3: raise RuntimeError('M1 data unavailable')
             x=pd.DataFrame(rates); x['time']=pd.to_datetime(x.time,unit='s',utc=True).dt.tz_convert(c.timezone); x=x.set_index('time').rename(columns={'open':'Open','high':'High','low':'Low','close':'Close'})[['Open','High','Low','Close']].astype(float); closed=x.iloc[:-1]; newest=closed.index[-1]
@@ -1353,8 +1388,16 @@ def main():
 
                 # Keep the original normal-signal execution path.
                 if state['signal'] is not None:
-                    execute_signal(c, client, db, state['signal'])
+                    pending_entry = state['signal']
                     pending_recovery = None
+
+                    logging.info(
+                        '[ENTRY] armed direction=%s entry=%.5f SL=%.5f TP=%.5f',
+                        pending_entry['side'],
+                        pending_entry['entry'],
+                        pending_entry['sl'],
+                        pending_entry['tp']
+                    )
 
                 render_dashboard(
                     state,
@@ -1363,6 +1406,8 @@ def main():
                     position_state=position_snapshot(client, db),
                     execution_state=LAST_EXECUTION
                 )
+                if pending_entry is not None:
+                    continue
             # Monitor recovered setup using live quotes, even between M1 candles.
             if pending_recovery is not None:
                 status, reason, bid, ask = monitor_recovery_entry(
